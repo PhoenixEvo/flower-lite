@@ -7,14 +7,16 @@ import nbformat as nbf
 # ==========================================
 nb_main = nbf.v4.new_notebook()
 
-nb_main.cells.append(nbf.v4.new_markdown_cell("""# 03_main.ipynb — Single-Stage Dual-GPU Training (CIFAR-10 on GPU 0, CIFAR-100 on GPU 1)
-This notebook trains 4 configurations per GPU concurrently:
-- **GPU 0**: CIFAR-10 (SGD lr 0.10, SGD lr 0.15, Adam lr 0.001, Adam lr 0.002)
-- **GPU 1**: CIFAR-100 (SGD lr 0.10, SGD lr 0.15, Adam lr 0.001, Adam lr 0.002)
-- Mode: **dev** (45,000 train / 5,000 validation)
-- Validation every epoch measuring both RAW and EMA metrics
-- Checkpointing and full resumption support with deterministic run IDs
-- Time Guard calibration and safe epoch projection
+nb_main.cells.append(nbf.v4.new_markdown_cell("""# 03_main.ipynb — Parameterized Training Pipeline (Sweep & Final Stages)
+This notebook supports two execution stages via the `STAGE` variable:
+- **`STAGE = "sweep"`**: Runs a 4-config hyperparameter sweep concurrently on GPU 0 (CIFAR-10) and GPU 1 (CIFAR-100).
+  Writes `/kaggle/working/results_sweep.csv` and selects best configs into `/kaggle/working/final_choice_sweep.json`
+  (including tie detection if difference < 0.5%).
+- **`STAGE = "final"`**: Runs the long final training for the selected configurations (1 config per dataset).
+  Auto-detects `final_choice_sweep.json` from attached inputs or uses the editable `FINAL_CONFIG` dict.
+  Writes `/kaggle/working/results_final.csv` and `/kaggle/working/final_choice.json`.
+- **Time Guard**: Calibrates seconds/epoch, projects total hours, and enforces `BUDGET_HOURS`.
+- **Deterministic Resumption**: Exactly resumes from `last.pt` and skips runs with `FINISHED` markers.
 """))
 
 nb_main.cells.append(nbf.v4.new_code_cell("""!nvidia-smi
@@ -48,13 +50,28 @@ torchvision.datasets.CIFAR100(root=DATA_ROOT, download=True)
 print("CIFAR-10 and CIFAR-100 verified.")
 """))
 
+nb_main.cells.append(nbf.v4.new_code_cell("""# ==========================================
+# STAGE & RUNTIME HYPERPARAMETERS
+# ==========================================
+STAGE = "sweep"  # Set to "sweep" or "final"
+
+EPOCHS = None    # Set to integer (e.g. 30 for sweep, 120 for final) or None to get Time Guard recommendation
+BUDGET_HOURS = 8.0  # Maximum wall-clock budget for this stage in hours
+
+# Human-editable configuration for STAGE == "final".
+# If values are None, it will auto-load from final_choice_sweep.json in attached input!
+FINAL_CONFIG = {
+    "cifar10": None,   # Example: {"optimizer": "sgd", "lr": 0.15, "weight_type": "ema", "epochs": 120}
+    "cifar100": None   # Example: {"optimizer": "adam", "lr": 0.001, "weight_type": "ema", "epochs": 120}
+}
+
+print(f"Active Stage: {STAGE.upper()}")
+"""))
+
 nb_main.cells.append(nbf.v4.new_code_cell("""import os
 import subprocess
 import time
 import math
-
-EPOCHS = None  # Human: Set this to an integer (e.g., 60, 80, 100) or leave as None to see safe recommendation
-BUDGET_HOURS = 8.0  # Maximum allowed budget for the entire dual-GPU run
 
 def measure_sec_per_epoch(gpu_id="0", batch_size=256, data_root="/kaggle/working/data"):
     print(f"Measuring real execution timing on GPU {gpu_id}...")
@@ -99,24 +116,25 @@ def measure_sec_per_epoch(gpu_id="0", batch_size=256, data_root="/kaggle/working
     print(f"--> Total seconds/epoch: {sec_per_epoch:.2f}s")
     return sec_per_epoch
 
-# Measure timing on GPU 0
 sec_per_epoch = measure_sec_per_epoch("0", data_root=DATA_ROOT)
 
-# Calculate safe N (largest N fitting BUDGET_HOURS for 4 configs per GPU)
-seconds_per_config_epoch = 4.0 * sec_per_epoch
+# Number of configs running sequentially per GPU: 4 for sweep, 1 for final
+num_runs_per_gpu = 4 if STAGE == "sweep" else 1
+seconds_per_config_epoch = num_runs_per_gpu * sec_per_epoch
 max_safe_N = math.floor((BUDGET_HOURS * 3600.0) / seconds_per_config_epoch)
 
-print(f"\\n================ TIME GUARD SUMMARY ================")
+print(f"\\n================ TIME GUARD SUMMARY ({STAGE.upper()}) ================")
 print(f"Measured sec/epoch: {sec_per_epoch:.2f}s")
+print(f"Configs per GPU: {num_runs_per_gpu}")
 print(f"Budget: {BUDGET_HOURS} hours")
-print(f"Largest safe N (epochs) that fits budget for 4 runs: {max_safe_N}")
-print(f"====================================================\\n")
+print(f"Largest safe N (epochs) that fits budget: {max_safe_N}")
+print(f"===============================================================\\n")
 
 if EPOCHS is None:
     raise ValueError(
-        f"EPOCHS is currently None! Based on measured {sec_per_epoch:.2f} s/epoch, "
+        f"EPOCHS is currently None! Based on measured {sec_per_epoch:.2f} s/epoch and {num_runs_per_gpu} runs per GPU, "
         f"the largest safe epoch count fitting BUDGET_HOURS ({BUDGET_HOURS}h) is {max_safe_N}. "
-        f"Please set EPOCHS = {max_safe_N} (or any integer <= {max_safe_N}) in this cell and re-run."
+        f"Please set EPOCHS = {max_safe_N} (or any integer <= {max_safe_N}) in Cell 3 and re-run."
     )
 
 projected_hours = (seconds_per_config_epoch * EPOCHS) / 3600.0
@@ -133,34 +151,99 @@ print("Time guard passed successfully! Proceeding to execution.")
 
 nb_main.cells.append(nbf.v4.new_code_cell("""import os
 import sys
-import time
+import glob
 import json
-import subprocess
 from pathlib import Path
 
 working_dir = Path("/kaggle/working")
 runs_dir = working_dir / "runs"
 runs_dir.mkdir(parents=True, exist_ok=True)
-results_csv = working_dir / "results.csv"
 
-# Configuration sequence (4 configs per GPU)
-configs_gpu0 = [
-    {"dataset": "cifar10", "optimizer": "sgd", "lr": 0.10, "run_id": "c10_sgd_0.10"},
-    {"dataset": "cifar10", "optimizer": "sgd", "lr": 0.15, "run_id": "c10_sgd_0.15"},
-    {"dataset": "cifar10", "optimizer": "adam", "lr": 0.001, "run_id": "c10_adam_0.001"},
-    {"dataset": "cifar10", "optimizer": "adam", "lr": 0.002, "run_id": "c10_adam_0.002"},
-]
+if STAGE == "sweep":
+    results_csv_name = "results_sweep.csv"
+    prefix = "sweep_"
+    configs_gpu0 = [
+        {"dataset": "cifar10", "optimizer": "sgd", "lr": 0.10, "epochs": EPOCHS, "run_id": f"{prefix}c10_sgd_0.10"},
+        {"dataset": "cifar10", "optimizer": "sgd", "lr": 0.15, "epochs": EPOCHS, "run_id": f"{prefix}c10_sgd_0.15"},
+        {"dataset": "cifar10", "optimizer": "adam", "lr": 0.001, "epochs": EPOCHS, "run_id": f"{prefix}c10_adam_0.001"},
+        {"dataset": "cifar10", "optimizer": "adam", "lr": 0.002, "epochs": EPOCHS, "run_id": f"{prefix}c10_adam_0.002"},
+    ]
+    configs_gpu1 = [
+        {"dataset": "cifar100", "optimizer": "sgd", "lr": 0.10, "epochs": EPOCHS, "run_id": f"{prefix}c100_sgd_0.10"},
+        {"dataset": "cifar100", "optimizer": "sgd", "lr": 0.15, "epochs": EPOCHS, "run_id": f"{prefix}c100_sgd_0.15"},
+        {"dataset": "cifar100", "optimizer": "adam", "lr": 0.001, "epochs": EPOCHS, "run_id": f"{prefix}c100_adam_0.001"},
+        {"dataset": "cifar100", "optimizer": "adam", "lr": 0.002, "epochs": EPOCHS, "run_id": f"{prefix}c100_adam_0.002"},
+    ]
+elif STAGE == "final":
+    results_csv_name = "results_final.csv"
+    prefix = "final_"
+    
+    # Auto-load final_choice_sweep.json if FINAL_CONFIG has None
+    c10_cfg = FINAL_CONFIG.get("cifar10")
+    c100_cfg = FINAL_CONFIG.get("cifar100")
+    
+    if c10_cfg is None or c100_cfg is None:
+        sweep_choice_candidates = glob.glob("/kaggle/input/*/final_choice_sweep.json") + \
+                                  glob.glob("/kaggle/input/*/*/final_choice_sweep.json") + \
+                                  glob.glob("experiments/final_choice_sweep.json") + \
+                                  glob.glob("/kaggle/working/final_choice_sweep.json")
+        if not sweep_choice_candidates:
+            raise FileNotFoundError(
+                "STAGE is 'final' but final_choice_sweep.json was not found in /kaggle/input/*/, "
+                "and FINAL_CONFIG entries are None. Please attach the output of the sweep run as input, "
+                "or specify FINAL_CONFIG explicitly in Cell 3."
+            )
+        choice_sweep_file = sweep_choice_candidates[0]
+        print(f"Loading sweep choices from: {choice_sweep_file}")
+        with open(choice_sweep_file, "r") as f:
+            sweep_data = json.load(f)
+            
+        if c10_cfg is None:
+            c10_entry = sweep_data["cifar10"]["winner"] if "winner" in sweep_data["cifar10"] else sweep_data["cifar10"]
+            c10_cfg = {
+                "optimizer": c10_entry["optimizer"],
+                "lr": c10_entry["lr"],
+                "epochs": EPOCHS if EPOCHS is not None else c10_entry.get("epochs", 120),
+                "weight_type": c10_entry.get("weight_type", "ema")
+            }
+        if c100_cfg is None:
+            c100_entry = sweep_data["cifar100"]["winner"] if "winner" in sweep_data["cifar100"] else sweep_data["cifar100"]
+            c100_cfg = {
+                "optimizer": c100_entry["optimizer"],
+                "lr": c100_entry["lr"],
+                "epochs": EPOCHS if EPOCHS is not None else c100_entry.get("epochs", 120),
+                "weight_type": c100_entry.get("weight_type", "ema")
+            }
 
-configs_gpu1 = [
-    {"dataset": "cifar100", "optimizer": "sgd", "lr": 0.10, "run_id": "c100_sgd_0.10"},
-    {"dataset": "cifar100", "optimizer": "sgd", "lr": 0.15, "run_id": "c100_sgd_0.15"},
-    {"dataset": "cifar100", "optimizer": "adam", "lr": 0.001, "run_id": "c100_adam_0.001"},
-    {"dataset": "cifar100", "optimizer": "adam", "lr": 0.002, "run_id": "c100_adam_0.002"},
-]
+    configs_gpu0 = [{
+        "dataset": "cifar10",
+        "optimizer": c10_cfg["optimizer"],
+        "lr": c10_cfg["lr"],
+        "epochs": c10_cfg.get("epochs", EPOCHS),
+        "run_id": f"{prefix}c10_{c10_cfg['optimizer']}_{c10_cfg['lr']}"
+    }]
+    configs_gpu1 = [{
+        "dataset": "cifar100",
+        "optimizer": c100_cfg["optimizer"],
+        "lr": c100_cfg["lr"],
+        "epochs": c100_cfg.get("epochs", EPOCHS),
+        "run_id": f"{prefix}c100_{c100_cfg['optimizer']}_{c100_cfg['lr']}"
+    }]
+else:
+    raise ValueError(f"Unknown STAGE '{STAGE}'. Must be 'sweep' or 'final'.")
 
-# Create worker runner script
+print(f"GPU 0 (CIFAR-10) Configs: {configs_gpu0}")
+print(f"GPU 1 (CIFAR-100) Configs: {configs_gpu1}")
+"""))
+
+nb_main.cells.append(nbf.v4.new_code_cell("""import subprocess
+import time
+
+results_csv = working_dir / results_csv_name
+
+# Write worker runner script
 runner_script = Path("/kaggle/working/worker_runner.py")
-runner_code = '''
+runner_code = f'''
 import sys
 import os
 import json
@@ -169,26 +252,27 @@ from pathlib import Path
 
 gpu_id = sys.argv[1]
 configs_json = sys.argv[2]
-epochs = int(sys.argv[3])
-data_root = sys.argv[4]
+data_root = sys.argv[3]
+results_csv_path = sys.argv[4]
 
 configs = json.loads(configs_json)
-log_file = Path(f"/kaggle/working/log_gpu{gpu_id}.txt")
+log_file = Path(f"/kaggle/working/log_gpu{{gpu_id}}.txt")
 
 with open(log_file, "a") as f:
-    f.write(f"=== Starting GPU {gpu_id} Worker ===\\n")
+    f.write(f"=== Starting GPU {{gpu_id}} Worker ===\\n")
 
 for cfg in configs:
     run_id = cfg["run_id"]
     dataset = cfg["dataset"]
     opt = cfg["optimizer"]
     lr = cfg["lr"]
+    epochs = cfg["epochs"]
     
     marker_local = Path("experiments") / run_id / "FINISHED"
     marker_work = Path("/kaggle/working/runs") / run_id / "FINISHED"
     if marker_local.exists() or marker_work.exists():
         with open(log_file, "a") as f:
-            f.write(f"[GPU {gpu_id}] Run {run_id} is already FINISHED. Skipping.\\n")
+            f.write(f"[GPU {{gpu_id}}] Run {{run_id}} is already FINISHED. Skipping.\\n")
         continue
 
     cmd = [
@@ -202,22 +286,22 @@ for cfg in configs:
         "--data-root", data_root,
         "--mode", "dev",
         "--resume",
-        "--results-csv", "/kaggle/working/results.csv",
-        "--export-dir", f"/kaggle/working/runs/{run_id}"
+        "--results-csv", results_csv_path,
+        "--export-dir", f"/kaggle/working/runs/{{run_id}}"
     ]
 
     with open(log_file, "a") as f:
-        f.write(f"[GPU {gpu_id}] Launching: {' '.join(cmd)}\\n")
+        f.write(f"[GPU {{gpu_id}}] Launching: {{' '.join(cmd)}}\\n")
         f.flush()
         ret = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
         if ret.returncode != 0:
-            f.write(f"[GPU {gpu_id}] Run {run_id} FAILED with return code {ret.returncode}\\n")
+            f.write(f"[GPU {{gpu_id}}] Run {{run_id}} FAILED with code {{ret.returncode}}\\n")
             sys.exit(ret.returncode)
         else:
-            f.write(f"[GPU {gpu_id}] Run {run_id} COMPLETED successfully.\\n")
+            f.write(f"[GPU {{gpu_id}}] Run {{run_id}} COMPLETED successfully.\\n")
 
 with open(log_file, "a") as f:
-    f.write(f"=== GPU {gpu_id} All Configs Done ===\\n")
+    f.write(f"=== GPU {{gpu_id}} All Configs Done ===\\n")
 '''
 runner_script.write_text(runner_code)
 
@@ -230,8 +314,8 @@ if os.path.exists(log_gpu1): os.remove(log_gpu1)
 env0 = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
 env1 = {**os.environ, "CUDA_VISIBLE_DEVICES": "1"}
 
-p0 = subprocess.Popen([sys.executable, str(runner_script), "0", json.dumps(configs_gpu0), str(EPOCHS), DATA_ROOT], env=env0)
-p1 = subprocess.Popen([sys.executable, str(runner_script), "1", json.dumps(configs_gpu1), str(EPOCHS), DATA_ROOT], env=env1)
+p0 = subprocess.Popen([sys.executable, str(runner_script), "0", json.dumps(configs_gpu0), DATA_ROOT, str(results_csv)], env=env0)
+p1 = subprocess.Popen([sys.executable, str(runner_script), "1", json.dumps(configs_gpu1), DATA_ROOT, str(results_csv)], env=env1)
 
 def print_tail(file_path, num_lines=15):
     if not os.path.exists(file_path):
@@ -264,64 +348,89 @@ nb_main.cells.append(nbf.v4.new_code_cell("""import json
 import pandas as pd
 from pathlib import Path
 
-results_file = Path("/kaggle/working/results.csv")
-if not results_file.exists():
-    raise RuntimeError("results.csv does not exist. No training runs recorded.")
+if not results_csv.exists():
+    raise RuntimeError(f"{results_csv} does not exist. No training runs recorded.")
 
-df = pd.read_csv(results_file)
-print("=================== COMPLETE RESULTS LEDGER (results.csv) ===================")
+df = pd.read_csv(results_csv)
+print(f"=================== RESULTS LEDGER ({results_csv_name}) ===================")
 print(df.to_string(index=False))
 
-summary_dict = {
-    "status": "completed",
-    "epochs": EPOCHS,
-    "cifar10": {},
-    "cifar100": {}
-}
+if STAGE == "sweep":
+    final_choice_sweep = {}
+    for dset in ["cifar10", "cifar100"]:
+        sub_df = df[df["dataset"] == dset].copy()
+        if sub_df.empty:
+            continue
+        sub_df["max_val_top1"] = sub_df[["best_val_top1_raw", "best_val_top1_ema"]].max(axis=1)
+        sorted_df = sub_df.sort_values(by="max_val_top1", ascending=False).reset_index(drop=True)
+        
+        top1_row = sorted_df.iloc[0]
+        w_type_1 = "ema" if top1_row["best_val_top1_ema"] >= top1_row["best_val_top1_raw"] else "raw"
+        score_1 = top1_row["best_val_top1_ema"] if w_type_1 == "ema" else top1_row["best_val_top1_raw"]
+        reason_1 = f"Selected {w_type_1.upper()} because {w_type_1.upper()} Top-1 ({score_1:.2f}%) >= alternative."
 
-final_choice = {}
+        entry = {
+            "winner": {
+                "run_id": f"sweep_{dset}_{top1_row['optimizer']}_{top1_row['lr']}",
+                "optimizer": top1_row["optimizer"],
+                "lr": float(top1_row["lr"]),
+                "weight_type": w_type_1,
+                "best_val_top1": float(score_1),
+                "reason": reason_1
+            },
+            "tie": False
+        }
 
-for dset in ["cifar10", "cifar100"]:
-    sub_df = df[df["dataset"] == dset]
-    if sub_df.empty:
-        continue
-    sub_df = sub_df.copy()
-    sub_df["max_val_top1"] = sub_df[["best_val_top1_raw", "best_val_top1_ema"]].max(axis=1)
-    best_row = sub_df.sort_values(by="max_val_top1", ascending=False).iloc[0]
-    
-    weight_type = "ema" if best_row["best_val_top1_ema"] >= best_row["best_val_top1_raw"] else "raw"
-    run_id = f"{dset}_{best_row['optimizer']}_{best_row['lr']}"
-    
-    summary_dict[dset] = {
-        "best_run_id": run_id,
-        "optimizer": best_row["optimizer"],
-        "lr": float(best_row["lr"]),
-        "best_val_top1_raw": float(best_row["best_val_top1_raw"]),
-        "best_val_top1_ema": float(best_row["best_val_top1_ema"]),
-        "best_weight_type": weight_type,
-        "best_epoch": int(best_row["best_epoch"]),
-        "wall_time": float(best_row["wall_time"])
-    }
-    
-    final_choice[dset] = {
-        "run_id": run_id,
-        "weight_type": weight_type
-    }
+        # Check for tie with 2nd place (< 0.5% difference)
+        if len(sorted_df) > 1:
+            top2_row = sorted_df.iloc[1]
+            w_type_2 = "ema" if top2_row["best_val_top1_ema"] >= top2_row["best_val_top1_raw"] else "raw"
+            score_2 = top2_row["best_val_top1_ema"] if w_type_2 == "ema" else top2_row["best_val_top1_raw"]
+            diff = abs(score_1 - score_2)
+            if diff < 0.5:
+                entry["tie"] = True
+                entry["tied_runner_up"] = {
+                    "run_id": f"sweep_{dset}_{top2_row['optimizer']}_{top2_row['lr']}",
+                    "optimizer": top2_row["optimizer"],
+                    "lr": float(top2_row["lr"]),
+                    "weight_type": w_type_2,
+                    "best_val_top1": float(score_2),
+                    "score_difference": float(diff)
+                }
+                print(f"[{dset.upper()}] Note: TIE detected between 1st ({score_1:.2f}%) and 2nd ({score_2:.2f}%), difference = {diff:.3f}% (< 0.5%).")
 
-print("\\n=================== BEST BY VALIDATION TABLE (Never picked by test) ===================")
-for dset, info in summary_dict.items():
-    if dset in ["cifar10", "cifar100"]:
-        print(f"[{dset.upper()}] Best Run: {info['best_run_id']} | Opt: {info['optimizer']} | LR: {info['lr']}")
-        print(f"  Val Top-1 Raw: {info['best_val_top1_raw']:.2f}% | Val Top-1 EMA: {info['best_val_top1_ema']:.2f}% (Selected: {info['best_weight_type'].upper()})")
-        print(f"  Best Epoch: {info['best_epoch']} | Wall Time: {info['wall_time']:.1f}s\\n")
+        final_choice_sweep[dset] = entry
 
-with open("/kaggle/working/summary.json", "w") as f:
-    json.dump(summary_dict, f, indent=4)
-print("Saved /kaggle/working/summary.json")
+    out_file = Path("/kaggle/working/final_choice_sweep.json")
+    with open(out_file, "w") as f:
+        json.dump(final_choice_sweep, f, indent=4)
+    print(f"\\nWrote sweep choice to {out_file}:")
+    print(json.dumps(final_choice_sweep, indent=2))
 
-with open("/kaggle/working/final_choice.json", "w") as f:
-    json.dump(final_choice, f, indent=4)
-print("Saved /kaggle/working/final_choice.json for 04_test.ipynb evaluation.")
+elif STAGE == "final":
+    final_choice = {}
+    for dset in ["cifar10", "cifar100"]:
+        sub_df = df[df["dataset"] == dset].copy()
+        if sub_df.empty:
+            continue
+        sub_df["max_val_top1"] = sub_df[["best_val_top1_raw", "best_val_top1_ema"]].max(axis=1)
+        best_row = sub_df.sort_values(by="max_val_top1", ascending=False).iloc[0]
+        w_type = "ema" if best_row["best_val_top1_ema"] >= best_row["best_val_top1_raw"] else "raw"
+        run_id = f"final_{dset}_{best_row['optimizer']}_{best_row['lr']}"
+        final_choice[dset] = {
+            "run_id": run_id,
+            "optimizer": best_row["optimizer"],
+            "lr": float(best_row["lr"]),
+            "weight_type": w_type,
+            "best_val_top1_raw": float(best_row["best_val_top1_raw"]),
+            "best_val_top1_ema": float(best_row["best_val_top1_ema"])
+        }
+
+    out_file = Path("/kaggle/working/final_choice.json")
+    with open(out_file, "w") as f:
+        json.dump(final_choice, f, indent=4)
+    print(f"\\nWrote final choice to {out_file}:")
+    print(json.dumps(final_choice, indent=2))
 """))
 
 with open("kaggle/03_main.ipynb", "w", encoding="utf-8") as f:
@@ -334,12 +443,12 @@ nb_test = nbf.v4.new_notebook()
 
 nb_test.cells.append(nbf.v4.new_markdown_cell("""# 04_test.ipynb — Final Test Set Evaluation under FREEZE Gate
 This notebook evaluates the models on the official CIFAR test set:
-1. **Auto-detects** attached read-only output from `03_main` under `/kaggle/input/*/final_choice.json`.
-2. **Copies** run folders into `/kaggle/working/runs/` treating the input as read-only.
-3. **DRY_RUN protection**: Default `DRY_RUN = True` lists all runs and stops before touching the test set.
-4. **FREEZE Protection**: Enforces `experiments/FREEZE.md`.
-5. **Write-once**: `eval_test.py` writes `test_results.json` once and refuses to overwrite.
-6. Evaluates winner runs selected by validation, plus other finished runs labeled `"reported, not used for selection"`.
+1. **Auto-detects** attached output from `03_main` (Stage "final") containing `final_choice.json`.
+2. **Sweep Reporting**: If `results_sweep.csv` is present, logs and reports sweep rows as validation numbers only.
+3. **Copies** run folders into `/kaggle/working/runs/` treating input as read-only.
+4. **DRY_RUN protection**: Default `DRY_RUN = True` lists what will be tested and stops before touching test data.
+5. **FREEZE Protection**: Enforces `experiments/FREEZE.md`.
+6. **Write-once**: `eval_test.py` writes `test_results.json` once per run and refuses to overwrite.
 """))
 
 nb_test.cells.append(nbf.v4.new_code_cell("""import os
@@ -368,7 +477,7 @@ print("Working Directory:", os.getcwd())
 assert os.path.exists("eval_test.py"), "eval_test.py must exist!"
 """))
 
-nb_test.cells.append(nbf.v4.new_code_cell("""# 1. Auto-detect training output from attached dataset
+nb_test.cells.append(nbf.v4.new_code_cell("""# 1. Auto-detect training output (final_choice.json from stage final)
 search_patterns = [
     "/kaggle/input/*/final_choice.json",
     "/kaggle/input/*/*/final_choice.json",
@@ -384,16 +493,16 @@ print(f"Detected candidates for final_choice.json: {candidates}")
 if len(candidates) == 0:
     raise FileNotFoundError(
         "Could not find any final_choice.json in /kaggle/input/*/ or /kaggle/input/*/*/. "
-        "Please attach the output of 03_main as an input to this notebook!"
+        "Please attach the output of 03_main (STAGE='final') as an input to this notebook!"
     )
 elif len(candidates) > 1:
     raise ValueError(
         f"Ambiguous training output: found multiple final_choice.json files: {candidates}. "
-        "Please ensure only one 03_main output dataset is attached."
+        "Please ensure only one final stage output dataset is attached."
     )
 
 choice_file = Path(candidates[0])
-print(f"Selected training output config: {choice_file}")
+print(f"Selected final training output config: {choice_file}")
 source_dir = choice_file.parent
 
 with open(choice_file, "r") as f:
@@ -401,6 +510,17 @@ with open(choice_file, "r") as f:
 
 print("Loaded final choices (selected strictly by validation):")
 print(json.dumps(final_choice, indent=2))
+
+# Check and report sweep results as validation numbers only
+sweep_csv_candidates = glob.glob(str(source_dir / "*results_sweep.csv")) + \
+                       glob.glob("/kaggle/input/*/results_sweep.csv") + \
+                       glob.glob("/kaggle/input/*/*/results_sweep.csv")
+
+if sweep_csv_candidates:
+    import pandas as pd
+    print(f"\\n[SWEEP VALIDATION REPORT ONLY] Found sweep results: {sweep_csv_candidates[0]}")
+    df_sw = pd.read_csv(sweep_csv_candidates[0])
+    print(df_sw.to_string(index=False))
 
 # 2. Treat input folder as read-only. Copy run folders to /kaggle/working/runs/
 working_dir = Path("/kaggle/working")
@@ -430,7 +550,7 @@ DRY_RUN = True  # Human: Set to False to perform actual test evaluation
 print(f"DRY_RUN status: {DRY_RUN}")
 if DRY_RUN:
     print("\\n============================== DRY RUN MODE ==============================")
-    print("The following chosen models (selected strictly by validation) WOULD be evaluated:")
+    print("The following chosen winner models (selected strictly by validation) WOULD be evaluated:")
     for dataset, info in final_choice.items():
         print(f"  * [{dataset.upper()}] Run: '{info['run_id']}' (Weights: '{info.get('weight_type', 'ema').upper()}')")
     print("\\nThe following other finished runs WOULD be evaluated as 'reported, not used for selection':")
@@ -491,7 +611,6 @@ import pandas as pd
 working_runs = Path("/kaggle/working/runs")
 all_evaluations = []
 
-# First, record the chosen winners
 for dataset, res in test_outputs.items():
     all_evaluations.append({
         "dataset": dataset,
@@ -505,7 +624,6 @@ for dataset, res in test_outputs.items():
         "role": "SELECTED WINNER (chosen by validation)"
     })
 
-# Next, record other finished runs
 for run_dir in sorted(working_runs.iterdir()):
     if not run_dir.is_dir():
         continue
@@ -557,6 +675,4 @@ print("\\nWrote /kaggle/working/all_test_evaluations.json")
 with open("kaggle/04_test.ipynb", "w", encoding="utf-8") as f:
     nbf.write(nb_test, f)
 
-print("Successfully regenerated kaggle/04_test.ipynb!")
-
-print("Successfully generated kaggle/03_main.ipynb and kaggle/04_test.ipynb!")
+print("Successfully generated parameterized kaggle/03_main.ipynb and kaggle/04_test.ipynb!")

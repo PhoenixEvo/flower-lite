@@ -92,8 +92,11 @@ def main():
     ema = EMA(model)
 
     # Data
-    use_mix = args.epochs >= 100
-    print(f"MixUp/CutMix enabled: {use_mix}")
+    if args.force_mix == "auto":
+        mix_status = "auto (MixUp/CutMix 50/50)" if args.epochs >= 100 else "disabled (epochs < 100)"
+    else:
+        mix_status = f"forced ({args.force_mix})"
+    print(f"MixUp/CutMix configuration: {mix_status}")
     
     # We need a manual split info for the development 45k/5k
     split_info = None
@@ -170,9 +173,15 @@ def main():
                             p.data.mul_(1.0 - lr * 5e-2)
 
             if args.force_mix == "auto":
-                active_mix = "mixup" if args.epochs >= 100 else "none"  # Simplified
+                if args.epochs >= 100:
+                    active_mix = "mixup" if torch.rand(1).item() < 0.5 else "cutmix"
+                else:
+                    active_mix = "none"
             else:
                 active_mix = args.force_mix
+
+            if step == 0 and epoch == 0 and active_mix != "none":
+                print(f"Batch augmentation active: {active_mix}")
 
             if active_mix != "none":
                 import numpy as np
