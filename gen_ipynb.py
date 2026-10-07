@@ -1,259 +1,488 @@
+import os
 
 import nbformat as nbf
 
-# --- 01_sweep.ipynb ---
-nb = nbf.v4.new_notebook()
-nb.cells.append(nbf.v4.new_markdown_cell('# Kaggle Sweep Phase'))
-nb.cells.append(nbf.v4.new_code_cell('!nvidia-smi\nimport torch\nprint("PyTorch:", torch.__version__, "GPUs:", torch.cuda.device_count())'))
-nb.cells.append(nbf.v4.new_code_cell('''import os
+# ==========================================
+# 1. kaggle/03_main.ipynb
+# ==========================================
+nb_main = nbf.v4.new_notebook()
+
+nb_main.cells.append(nbf.v4.new_markdown_cell("""# 03_main.ipynb — Single-Stage Dual-GPU Training (CIFAR-10 on GPU 0, CIFAR-100 on GPU 1)
+This notebook trains 4 configurations per GPU concurrently:
+- **GPU 0**: CIFAR-10 (SGD lr 0.10, SGD lr 0.15, Adam lr 0.001, Adam lr 0.002)
+- **GPU 1**: CIFAR-100 (SGD lr 0.10, SGD lr 0.15, Adam lr 0.001, Adam lr 0.002)
+- Mode: **dev** (45,000 train / 5,000 validation)
+- Validation every epoch measuring both RAW and EMA metrics
+- Checkpointing and full resumption support with deterministic run IDs
+- Time Guard calibration and safe epoch projection
+"""))
+
+nb_main.cells.append(nbf.v4.new_code_cell("""!nvidia-smi
+import torch
+print(f"PyTorch Version: {torch.__version__}, Available GPUs: {torch.cuda.device_count()}")
+"""))
+
+nb_main.cells.append(nbf.v4.new_code_cell("""import os
 import shutil
 
-REPO_SOURCE = "git" # change to "kaggle" if using an attached dataset
-REPO_URL = "<YOUR_REPO_URL>"
+REPO_SOURCE = "git"  # Options: "git" or "kaggle"
+REPO_URL = "https://github.com/PhoenixEvo/flower-lite.git"
 
 if REPO_SOURCE == "git":
-    if not os.path.exists("flowerlite"):
-        os.system(f"git clone {REPO_URL} flowerlite")
-    os.chdir("flowerlite")
+    if not os.path.exists("flower-lite"):
+        os.system(f"git clone {REPO_URL} flower-lite")
+    os.chdir("flower-lite")
 else:
-    # Example dataset path
-    os.system("cp -r /kaggle/input/flowerlite-repo /kaggle/working/flowerlite")
-    os.chdir("/kaggle/working/flowerlite")
+    if os.path.exists("/kaggle/input/flowerlite-repo"):
+        os.system("cp -r /kaggle/input/flowerlite-repo /kaggle/working/flower-lite")
+    os.chdir("/kaggle/working/flower-lite")
 
 os.system("pip install -e .")
-import flowerlite # verify import
-print("Successfully imported flowerlite!")
+import flowerlite
+print("FlowerLite package successfully imported!")
 
+DATA_ROOT = "/kaggle/working/data"
 import torchvision
-torchvision.datasets.CIFAR10(root='/kaggle/working/data', download=True)
-torchvision.datasets.CIFAR100(root='/kaggle/working/data', download=True)
-'''))
+torchvision.datasets.CIFAR10(root=DATA_ROOT, download=True)
+torchvision.datasets.CIFAR100(root=DATA_ROOT, download=True)
+print("CIFAR-10 and CIFAR-100 verified.")
+"""))
 
-nb.cells.append(nbf.v4.new_code_cell('''import subprocess, time, os
+nb_main.cells.append(nbf.v4.new_code_cell("""import os
+import subprocess
+import time
+import math
 
-def measure_sec_per_epoch(gpu_id="0", batch_size=256):
-    print(f"Measuring timing on GPU {gpu_id}...")
+EPOCHS = None  # Human: Set this to an integer (e.g., 60, 80, 100) or leave as None to see safe recommendation
+BUDGET_HOURS = 8.0  # Maximum allowed budget for the entire dual-GPU run
+
+def measure_sec_per_epoch(gpu_id="0", batch_size=256, data_root="/kaggle/working/data"):
+    print(f"Measuring real execution timing on GPU {gpu_id}...")
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_id}
-    cmd = ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar10", 
-           "--optimizer", "sgd", "--lr", "0.1", "--epochs", "1", "--run-id", "timing_run", 
-           "--max-steps", "115", "--data-root", "/kaggle/working/data"]
+    probe_id = f"timing_probe_gpu{gpu_id}_{int(time.time())}"
+    cmd = [
+        "python", "train.py",
+        "--config", "configs/base.yaml",
+        "--dataset", "cifar10",
+        "--optimizer", "sgd",
+        "--lr", "0.1",
+        "--epochs", "1",
+        "--run-id", probe_id,
+        "--max-steps", "115",
+        "--data-root", data_root,
+        "--mode", "dev"
+    ]
     
     res = subprocess.run(cmd, env=env, capture_output=True, text=True)
     
     elapsed_100_steps = None
+    val_time = None
     for line in res.stdout.split("\\n"):
         if "Timing (Steps 10-110)" in line:
             elapsed_100_steps = float(line.split(":")[1].replace("s", "").replace("-", "").strip())
-            break
+        if "Val Time" in line:
+            val_time = float(line.split(":")[1].replace("s", "").replace("-", "").strip())
             
-    if elapsed_100_steps is None:
-        print(res.stdout)
-        raise RuntimeError("Could not measure timing cleanly. See logs above.")
+    if elapsed_100_steps is None or val_time is None:
+        print("Probe Output STDOUT:\\n", res.stdout)
+        print("Probe Output STDERR:\\n", res.stderr)
+        raise RuntimeError("Failed to extract 100-step timing and validation timing from probe output.")
+        
+    steps_per_epoch = math.ceil(45000 / batch_size) # 176 steps per epoch
+    train_time_per_epoch = (elapsed_100_steps / 100.0) * steps_per_epoch
+    sec_per_epoch = train_time_per_epoch + val_time
+    steps_per_sec = 100.0 / elapsed_100_steps
     
-    steps_per_epoch = 45000 / batch_size
-    sec_per_epoch = (elapsed_100_steps / 100) * steps_per_epoch
-    
-    print(f"100 steps took {elapsed_100_steps:.2f}s (excl. start-up & validation). Steps/s: {100 / elapsed_100_steps:.2f}")
+    print(f"--> Measured steps/s: {steps_per_sec:.2f}")
+    print(f"--> Train time per epoch (176 steps): {train_time_per_epoch:.2f}s")
+    print(f"--> Validation time per epoch (5k images): {val_time:.2f}s")
+    print(f"--> Total seconds/epoch: {sec_per_epoch:.2f}s")
     return sec_per_epoch
 
-sec_per_epoch = measure_sec_per_epoch("0")
-print(f"Measured sec/epoch: {sec_per_epoch:.2f}")
+# Measure timing on GPU 0
+sec_per_epoch = measure_sec_per_epoch("0", data_root=DATA_ROOT)
 
-planned_epochs = 4 * 30 # 4 configs * 30 epochs
-total_hours = (sec_per_epoch * planned_epochs) / 3600
-print(f'Projected wall-clock: {total_hours:.2f} hours')
+# Calculate safe N (largest N fitting BUDGET_HOURS for 4 configs per GPU)
+seconds_per_config_epoch = 4.0 * sec_per_epoch
+max_safe_N = math.floor((BUDGET_HOURS * 3600.0) / seconds_per_config_epoch)
 
-if total_hours > 6.0:
-    raise Exception("Projection exceeds 6 hours. Consider lowering epoch count. Halting.")
+print(f"\\n================ TIME GUARD SUMMARY ================")
+print(f"Measured sec/epoch: {sec_per_epoch:.2f}s")
+print(f"Budget: {BUDGET_HOURS} hours")
+print(f"Largest safe N (epochs) that fits budget for 4 runs: {max_safe_N}")
+print(f"====================================================\\n")
 
-print('Starting Sweep in background...')
-cmds_0 = [
-    ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar10", "--optimizer", "sgd", "--lr", "0.10", "--epochs", "30", "--run-id", "sweep_c10_sgd_10", "--data-root", "/kaggle/working/data"],
-    ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar10", "--optimizer", "sgd", "--lr", "0.15", "--epochs", "30", "--run-id", "sweep_c10_sgd_15", "--data-root", "/kaggle/working/data"],
-    ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar10", "--optimizer", "adam", "--lr", "0.001", "--epochs", "30", "--run-id", "sweep_c10_adam_001", "--data-root", "/kaggle/working/data"],
-    ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar10", "--optimizer", "adam", "--lr", "0.002", "--epochs", "30", "--run-id", "sweep_c10_adam_002", "--data-root", "/kaggle/working/data"]
-]
+if EPOCHS is None:
+    raise ValueError(
+        f"EPOCHS is currently None! Based on measured {sec_per_epoch:.2f} s/epoch, "
+        f"the largest safe epoch count fitting BUDGET_HOURS ({BUDGET_HOURS}h) is {max_safe_N}. "
+        f"Please set EPOCHS = {max_safe_N} (or any integer <= {max_safe_N}) in this cell and re-run."
+    )
 
-cmds_1 = [
-    ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar100", "--optimizer", "sgd", "--lr", "0.10", "--epochs", "30", "--run-id", "sweep_c100_sgd_10", "--data-root", "/kaggle/working/data"],
-    ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar100", "--optimizer", "sgd", "--lr", "0.15", "--epochs", "30", "--run-id", "sweep_c100_sgd_15", "--data-root", "/kaggle/working/data"],
-    ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar100", "--optimizer", "adam", "--lr", "0.001", "--epochs", "30", "--run-id", "sweep_c100_adam_001", "--data-root", "/kaggle/working/data"],
-    ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar100", "--optimizer", "adam", "--lr", "0.002", "--epochs", "30", "--run-id", "sweep_c100_adam_002", "--data-root", "/kaggle/working/data"]
-]
+projected_hours = (seconds_per_config_epoch * EPOCHS) / 3600.0
+print(f"Configured EPOCHS: {EPOCHS}")
+print(f"Projected wall-clock time: {projected_hours:.2f} hours (Budget: {BUDGET_HOURS} hours)")
 
-def run_sequence(cmds, gpu, log_file):
-    with open(log_file, "w") as f:
-        f.write(f"--- Starting GPU {gpu} sequence ---\\n")
-    
-    script_path = f"/kaggle/working/run_gpu{gpu}.sh"
-    with open(script_path, "w") as f:
-        f.write("#!/bin/bash\\n")
-        for cmd in cmds:
-            f.write(" ".join(cmd) + f" >> {log_file} 2>&1\\n")
-            f.write(f"cp -r experiments/{cmd[13]} /kaggle/working/\\n") # copy run dir out
-    
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu}
-    return subprocess.Popen(["bash", script_path], env=env)
+if projected_hours > BUDGET_HOURS:
+    raise RuntimeError(
+        f"Projected runtime ({projected_hours:.2f}h) EXCEEDS budget ({BUDGET_HOURS}h)! "
+        f"The maximum safe epoch count is {max_safe_N}. Please reduce EPOCHS <= {max_safe_N}."
+    )
+print("Time guard passed successfully! Proceeding to execution.")
+"""))
 
-p0 = run_sequence(cmds_0, "0", "/kaggle/working/log_gpu0.txt")
-p1 = run_sequence(cmds_1, "1", "/kaggle/working/log_gpu1.txt")
-
+nb_main.cells.append(nbf.v4.new_code_cell("""import os
 import sys
-while p0.poll() is None or p1.poll() is None:
-    time.sleep(30)
-    print("--- GPU 0 Last 15 Lines ---")
-    os.system("tail -n 15 /kaggle/working/log_gpu0.txt")
-    print("--- GPU 1 Last 15 Lines ---")
-    os.system("tail -n 15 /kaggle/working/log_gpu1.txt")
-    sys.stdout.flush()
-
-p0.wait()
-p1.wait()
-
-print("Sweep Complete. Output directories copied to /kaggle/working/")
-# Compile summary json
+import time
 import json
-with open("/kaggle/working/summary.json", "w") as f:
-    json.dump({"status": "sweep_completed"}, f)
-'''))
+import subprocess
+from pathlib import Path
 
-with open('kaggle/01_sweep.ipynb', 'w') as f:
-    nbf.write(nb, f)
+working_dir = Path("/kaggle/working")
+runs_dir = working_dir / "runs"
+runs_dir.mkdir(parents=True, exist_ok=True)
+results_csv = working_dir / "results.csv"
 
-# --- 02_final.ipynb ---
-nb2 = nbf.v4.new_notebook()
-nb2.cells.append(nbf.v4.new_markdown_cell('# Kaggle Final Phase'))
-nb2.cells.append(nbf.v4.new_code_cell('!nvidia-smi\nimport torch\nprint("PyTorch:", torch.__version__, "GPUs:", torch.cuda.device_count())'))
-nb2.cells.append(nbf.v4.new_code_cell('''import os
-import shutil
+# Configuration sequence (4 configs per GPU)
+configs_gpu0 = [
+    {"dataset": "cifar10", "optimizer": "sgd", "lr": 0.10, "run_id": "c10_sgd_0.10"},
+    {"dataset": "cifar10", "optimizer": "sgd", "lr": 0.15, "run_id": "c10_sgd_0.15"},
+    {"dataset": "cifar10", "optimizer": "adam", "lr": 0.001, "run_id": "c10_adam_0.001"},
+    {"dataset": "cifar10", "optimizer": "adam", "lr": 0.002, "run_id": "c10_adam_0.002"},
+]
 
-REPO_SOURCE = "git" # change to "kaggle" if using an attached dataset
-REPO_URL = "<YOUR_REPO_URL>"
+configs_gpu1 = [
+    {"dataset": "cifar100", "optimizer": "sgd", "lr": 0.10, "run_id": "c100_sgd_0.10"},
+    {"dataset": "cifar100", "optimizer": "sgd", "lr": 0.15, "run_id": "c100_sgd_0.15"},
+    {"dataset": "cifar100", "optimizer": "adam", "lr": 0.001, "run_id": "c100_adam_0.001"},
+    {"dataset": "cifar100", "optimizer": "adam", "lr": 0.002, "run_id": "c100_adam_0.002"},
+]
 
-if REPO_SOURCE == "git":
-    if not os.path.exists("flowerlite"):
-        os.system(f"git clone {REPO_URL} flowerlite")
-    os.chdir("flowerlite")
-else:
-    os.system("cp -r /kaggle/input/flowerlite-repo /kaggle/working/flowerlite")
-    os.chdir("/kaggle/working/flowerlite")
+# Create worker runner script
+runner_script = Path("/kaggle/working/worker_runner.py")
+runner_code = '''
+import sys
+import os
+import json
+import subprocess
+from pathlib import Path
 
-os.system("pip install -e .")
-import flowerlite # verify import
-print("Successfully imported flowerlite!")
+gpu_id = sys.argv[1]
+configs_json = sys.argv[2]
+epochs = int(sys.argv[3])
+data_root = sys.argv[4]
 
-import torchvision
-torchvision.datasets.CIFAR10(root='/kaggle/working/data', download=True)
-torchvision.datasets.CIFAR100(root='/kaggle/working/data', download=True)
-'''))
+configs = json.loads(configs_json)
+log_file = Path(f"/kaggle/working/log_gpu{gpu_id}.txt")
 
-nb2.cells.append(nbf.v4.new_code_cell('''import json
-config = {
-    'cifar10': {'optimizer': 'sgd', 'lr': 0.1, 'epochs': None},
-    'cifar100': {'optimizer': 'sgd', 'lr': 0.1, 'epochs': None}
-}
-if not os.path.exists('/kaggle/working/final_config.json'):
-    with open('/kaggle/working/final_config.json', 'w') as f:
-        json.dump(config, f)
-print('Edit /kaggle/working/final_config.json as needed. Fill in epochs!')
-'''))
+with open(log_file, "a") as f:
+    f.write(f"=== Starting GPU {gpu_id} Worker ===\\n")
 
-nb2.cells.append(nbf.v4.new_code_cell('''import subprocess, time, json, os, sys
-
-with open('/kaggle/working/final_config.json') as f:
-    cfg = json.load(f)
-
-if cfg['cifar10']['epochs'] is None or cfg['cifar100']['epochs'] is None:
-    raise ValueError("Epochs in final_config.json cannot be null. Please edit the JSON and provide epoch counts.")
-
-FINAL_TRAIN_ON_FULL = False
-if FINAL_TRAIN_ON_FULL:
-    print("WARNING: Training on full 50,000 examples (mode=final). No validation split is available!")
-    print("WARNING: You cannot choose between EMA vs RAW weights using validation metrics! (Will default to EMA).")
-    mode_str = "final"
-else:
-    mode_str = "dev"
+for cfg in configs:
+    run_id = cfg["run_id"]
+    dataset = cfg["dataset"]
+    opt = cfg["optimizer"]
+    lr = cfg["lr"]
     
-def measure_sec_per_epoch(gpu_id="0", batch_size=256):
-    print(f"Measuring timing on GPU {gpu_id}...")
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu_id}
-    cmd = ["python", "train.py", "--config", "configs/base.yaml", "--dataset", "cifar10", 
-           "--optimizer", "sgd", "--lr", "0.1", "--epochs", "1", "--run-id", "timing_run", 
-           "--max-steps", "115", "--data-root", "/kaggle/working/data"]
-    
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    
-    elapsed_100_steps = None
-    for line in res.stdout.split("\\n"):
-        if "Timing (Steps 10-110)" in line:
-            elapsed_100_steps = float(line.split(":")[1].replace("s", "").replace("-", "").strip())
-            break
-            
-    if elapsed_100_steps is None:
-        print(res.stdout)
-        raise RuntimeError("Could not measure timing cleanly. See logs above.")
-    
-    steps_per_epoch = 50000 / batch_size if FINAL_TRAIN_ON_FULL else 45000 / batch_size
-    sec_per_epoch = (elapsed_100_steps / 100) * steps_per_epoch
-    
-    print(f"100 steps took {elapsed_100_steps:.2f}s (excl. start-up & validation). Steps/s: {100 / elapsed_100_steps:.2f}")
-    return sec_per_epoch
+    marker_local = Path("experiments") / run_id / "FINISHED"
+    marker_work = Path("/kaggle/working/runs") / run_id / "FINISHED"
+    if marker_local.exists() or marker_work.exists():
+        with open(log_file, "a") as f:
+            f.write(f"[GPU {gpu_id}] Run {run_id} is already FINISHED. Skipping.\\n")
+        continue
 
-sec_per_epoch = measure_sec_per_epoch("0")
-print(f"Measured sec/epoch: {sec_per_epoch:.2f}")
+    cmd = [
+        sys.executable, "train.py",
+        "--config", "configs/base.yaml",
+        "--dataset", dataset,
+        "--optimizer", opt,
+        "--lr", str(lr),
+        "--epochs", str(epochs),
+        "--run-id", run_id,
+        "--data-root", data_root,
+        "--mode", "dev",
+        "--resume",
+        "--results-csv", "/kaggle/working/results.csv",
+        "--export-dir", f"/kaggle/working/runs/{run_id}"
+    ]
 
-planned_epochs = max(cfg['cifar10']['epochs'], cfg['cifar100']['epochs'])
-total_hours = (sec_per_epoch * planned_epochs) / 3600
-print(f'Projected wall-clock: {total_hours:.2f} hours')
+    with open(log_file, "a") as f:
+        f.write(f"[GPU {gpu_id}] Launching: {' '.join(cmd)}\\n")
+        f.flush()
+        ret = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+        if ret.returncode != 0:
+            f.write(f"[GPU {gpu_id}] Run {run_id} FAILED with return code {ret.returncode}\\n")
+            sys.exit(ret.returncode)
+        else:
+            f.write(f"[GPU {gpu_id}] Run {run_id} COMPLETED successfully.\\n")
 
-if total_hours > 5.0:
-    raise Exception("Projection exceeds 5 hours. Consider lowering epoch count. Halting.")
+with open(log_file, "a") as f:
+    f.write(f"=== GPU {gpu_id} All Configs Done ===\\n")
+'''
+runner_script.write_text(runner_code)
 
-print('Starting Final in background...')
-os.makedirs("experiments", exist_ok=True)
-with open("experiments/FREEZE.md", "w") as f:
-    f.write("FREEZE")
+log_gpu0 = "/kaggle/working/log_gpu0.txt"
+log_gpu1 = "/kaggle/working/log_gpu1.txt"
+if os.path.exists(log_gpu0): os.remove(log_gpu0)
+if os.path.exists(log_gpu1): os.remove(log_gpu1)
 
-# Write manifest choice
-with open("experiments/manifest_choice.txt", "w") as f:
-    f.write(f"FINAL_TRAIN_ON_FULL={FINAL_TRAIN_ON_FULL}")
-
-run_id_c10 = f"final_c10_{int(time.time())}"
-run_id_c100 = f"final_c100_{int(time.time())}"
-
-c10_cmd = f"python train.py --config configs/base.yaml --dataset cifar10 --optimizer {cfg['cifar10']['optimizer']} --lr {cfg['cifar10']['lr']} --epochs {cfg['cifar10']['epochs']} --run-id {run_id_c10} --data-root /kaggle/working/data --resume --mode {mode_str} >> /kaggle/working/log_final_c10.txt 2>&1 && python eval_test.py --run-id {run_id_c10} --dataset cifar10 >> /kaggle/working/log_final_c10.txt 2>&1 && cp -r experiments/{run_id_c10} /kaggle/working/final_c10"
-
-c100_cmd = f"python train.py --config configs/base.yaml --dataset cifar100 --optimizer {cfg['cifar100']['optimizer']} --lr {cfg['cifar100']['lr']} --epochs {cfg['cifar100']['epochs']} --run-id {run_id_c100} --data-root /kaggle/working/data --resume --mode {mode_str} >> /kaggle/working/log_final_c100.txt 2>&1 && python eval_test.py --run-id {run_id_c100} --dataset cifar100 >> /kaggle/working/log_final_c100.txt 2>&1 && cp -r experiments/{run_id_c100} /kaggle/working/final_c100"
-
-with open("/kaggle/working/run_gpu0.sh", "w") as f:
-    f.write("#!/bin/bash\\n")
-    f.write(c10_cmd + "\\n")
-    
-with open("/kaggle/working/run_gpu1.sh", "w") as f:
-    f.write("#!/bin/bash\\n")
-    f.write(c100_cmd + "\\n")
-
+# Launch workers concurrently
 env0 = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
 env1 = {**os.environ, "CUDA_VISIBLE_DEVICES": "1"}
 
-p0 = subprocess.Popen(["bash", "/kaggle/working/run_gpu0.sh"], env=env0)
-p1 = subprocess.Popen(["bash", "/kaggle/working/run_gpu1.sh"], env=env1)
+p0 = subprocess.Popen([sys.executable, str(runner_script), "0", json.dumps(configs_gpu0), str(EPOCHS), DATA_ROOT], env=env0)
+p1 = subprocess.Popen([sys.executable, str(runner_script), "1", json.dumps(configs_gpu1), str(EPOCHS), DATA_ROOT], env=env1)
 
+def print_tail(file_path, num_lines=15):
+    if not os.path.exists(file_path):
+        print(f"[{file_path}] Waiting for output...")
+        return
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+            for l in lines[-num_lines:]:
+                print(l.rstrip())
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+
+print("Dual GPU workers launched. Polling progress every 30s...")
 while p0.poll() is None or p1.poll() is None:
     time.sleep(30)
-    print("--- GPU 0 Last 15 Lines ---")
-    os.system("tail -n 15 /kaggle/working/log_final_c10.txt")
-    print("--- GPU 1 Last 15 Lines ---")
-    os.system("tail -n 15 /kaggle/working/log_final_c100.txt")
+    current_time = time.strftime("%H:%M:%S")
+    print(f"\\n==================== [GPU 0 | {current_time}] Last 15 Lines ====================")
+    print_tail(log_gpu0, 15)
+    print(f"==================== [GPU 1 | {current_time}] Last 15 Lines ====================")
+    print_tail(log_gpu1, 15)
     sys.stdout.flush()
 
 p0.wait()
 p1.wait()
+print("\\nBoth GPU workers have finished execution.")
+"""))
 
-print("Final Complete. Output directories copied to /kaggle/working/")
+nb_main.cells.append(nbf.v4.new_code_cell("""import json
+import pandas as pd
+from pathlib import Path
+
+results_file = Path("/kaggle/working/results.csv")
+if not results_file.exists():
+    raise RuntimeError("results.csv does not exist. No training runs recorded.")
+
+df = pd.read_csv(results_file)
+print("=================== COMPLETE RESULTS LEDGER (results.csv) ===================")
+print(df.to_string(index=False))
+
+summary_dict = {
+    "status": "completed",
+    "epochs": EPOCHS,
+    "cifar10": {},
+    "cifar100": {}
+}
+
+final_choice = {}
+
+for dset in ["cifar10", "cifar100"]:
+    sub_df = df[df["dataset"] == dset]
+    if sub_df.empty:
+        continue
+    sub_df = sub_df.copy()
+    sub_df["max_val_top1"] = sub_df[["best_val_top1_raw", "best_val_top1_ema"]].max(axis=1)
+    best_row = sub_df.sort_values(by="max_val_top1", ascending=False).iloc[0]
+    
+    weight_type = "ema" if best_row["best_val_top1_ema"] >= best_row["best_val_top1_raw"] else "raw"
+    run_id = f"{dset}_{best_row['optimizer']}_{best_row['lr']}"
+    
+    summary_dict[dset] = {
+        "best_run_id": run_id,
+        "optimizer": best_row["optimizer"],
+        "lr": float(best_row["lr"]),
+        "best_val_top1_raw": float(best_row["best_val_top1_raw"]),
+        "best_val_top1_ema": float(best_row["best_val_top1_ema"]),
+        "best_weight_type": weight_type,
+        "best_epoch": int(best_row["best_epoch"]),
+        "wall_time": float(best_row["wall_time"])
+    }
+    
+    final_choice[dset] = {
+        "run_id": run_id,
+        "weight_type": weight_type
+    }
+
+print("\\n=================== BEST BY VALIDATION TABLE (Never picked by test) ===================")
+for dset, info in summary_dict.items():
+    if dset in ["cifar10", "cifar100"]:
+        print(f"[{dset.upper()}] Best Run: {info['best_run_id']} | Opt: {info['optimizer']} | LR: {info['lr']}")
+        print(f"  Val Top-1 Raw: {info['best_val_top1_raw']:.2f}% | Val Top-1 EMA: {info['best_val_top1_ema']:.2f}% (Selected: {info['best_weight_type'].upper()})")
+        print(f"  Best Epoch: {info['best_epoch']} | Wall Time: {info['wall_time']:.1f}s\\n")
+
 with open("/kaggle/working/summary.json", "w") as f:
-    json.dump({"status": "final_completed"}, f)
-'''))
+    json.dump(summary_dict, f, indent=4)
+print("Saved /kaggle/working/summary.json")
 
-with open('kaggle/02_final.ipynb', 'w') as f:
-    nbf.write(nb2, f)
+with open("/kaggle/working/final_choice.json", "w") as f:
+    json.dump(final_choice, f, indent=4)
+print("Saved /kaggle/working/final_choice.json for 04_test.ipynb evaluation.")
+"""))
+
+with open("kaggle/03_main.ipynb", "w", encoding="utf-8") as f:
+    nbf.write(nb_main, f)
+
+# ==========================================
+# 2. kaggle/04_test.ipynb
+# ==========================================
+nb_test = nbf.v4.new_notebook()
+
+nb_test.cells.append(nbf.v4.new_markdown_cell("""# 04_test.ipynb — Final Test Set Evaluation under FREEZE Gate
+This notebook evaluates the models on the official test set:
+- Enforces `experiments/FREEZE.md` barrier.
+- Evaluates the models selected by validation from `final_choice.json` once per dataset.
+- Evaluates all other finished runs once, labeled: `"reported, not used for selection"`.
+- Refuses to overwrite any existing `test_results.json`.
+"""))
+
+nb_test.cells.append(nbf.v4.new_code_cell("""import os
+import sys
+import json
+import subprocess
+from pathlib import Path
+
+if not os.path.exists("eval_test.py"):
+    if os.path.exists("flower-lite"):
+        os.chdir("flower-lite")
+    elif os.path.exists("/kaggle/working/flower-lite"):
+        os.chdir("/kaggle/working/flower-lite")
+
+print("Working Directory:", os.getcwd())
+assert os.path.exists("eval_test.py"), "eval_test.py must exist!"
+"""))
+
+nb_test.cells.append(nbf.v4.new_code_cell("""# Enforce FREEZE gate
+os.makedirs("experiments", exist_ok=True)
+freeze_file = Path("experiments/FREEZE.md")
+with open(freeze_file, "w") as f:
+    f.write("# FREEZE\\nModel selection finalized. Test set unlocked for single-pass evaluation.\\n")
+print("FREEZE.md written. Test evaluation unlocked.")
+
+choice_file = Path("/kaggle/working/final_choice.json")
+if not choice_file.exists():
+    choice_file = Path("experiments/final_choice.json")
+
+if not choice_file.exists():
+    raise FileNotFoundError("final_choice.json not found! Run 03_main.ipynb first.")
+
+with open(choice_file, "r") as f:
+    final_choice = json.load(f)
+
+print("Final choice loaded:")
+print(json.dumps(final_choice, indent=2))
+"""))
+
+nb_test.cells.append(nbf.v4.new_code_cell("""# Evaluate chosen models on official test set
+test_outputs = {}
+
+for dataset, info in final_choice.items():
+    run_id = info["run_id"]
+    weight_type = info.get("weight_type", "ema")
+    
+    print(f"\\nEvaluating WINNER for {dataset.upper()} (Run ID: {run_id}, Weights: {weight_type.upper()})")
+    
+    ckpt_dir = f"/kaggle/working/runs/{run_id}"
+    if not os.path.exists(ckpt_dir):
+        ckpt_dir = f"experiments/{run_id}"
+        
+    cmd = [
+        sys.executable, "eval_test.py",
+        "--run-id", run_id,
+        "--dataset", dataset,
+        "--weight-type", weight_type,
+        "--checkpoint-dir", ckpt_dir,
+        "--output-dir", ckpt_dir,
+        "--data-root", "/kaggle/working/data"
+    ]
+    
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    print(res.stdout)
+    if res.returncode != 0:
+        print("STDERR:\\n", res.stderr)
+        raise RuntimeError(f"eval_test.py failed for {run_id}")
+        
+    res_json_path = os.path.join(ckpt_dir, "test_results.json")
+    with open(res_json_path, "r") as f:
+        test_outputs[dataset] = json.load(f)
+"""))
+
+nb_test.cells.append(nbf.v4.new_code_cell("""from pathlib import Path
+import json
+import pandas as pd
+
+runs_base = Path("/kaggle/working/runs")
+if not runs_base.exists():
+    runs_base = Path("experiments")
+
+all_evaluations = []
+
+for dataset, res in test_outputs.items():
+    all_evaluations.append({
+        "dataset": dataset,
+        "run_id": res["run_id"],
+        "weight_type": res["weight_type"],
+        "top1": res["top1"],
+        "top5": res["top5"],
+        "macro_f1": res["macro_f1"],
+        "nll": res["nll"],
+        "ece": res["ece"],
+        "role": "SELECTED WINNER (chosen by validation)"
+    })
+
+for run_dir in sorted(runs_base.iterdir()):
+    if not run_dir.is_dir():
+        continue
+    run_id = run_dir.name
+    if any(e["run_id"] == run_id for e in all_evaluations):
+        continue
+        
+    dataset = "cifar10" if "c10_" in run_id or "cifar10" in run_id else "cifar100"
+    res_path = run_dir / "test_results.json"
+    
+    if not res_path.exists():
+        cmd = [
+            sys.executable, "eval_test.py",
+            "--run-id", run_id,
+            "--dataset", dataset,
+            "--weight-type", "ema",
+            "--checkpoint-dir", str(run_dir),
+            "--output-dir", str(run_dir),
+            "--data-root", "/kaggle/working/data"
+        ]
+        sub_res = subprocess.run(cmd, capture_output=True, text=True)
+        if sub_res.returncode != 0:
+            print(f"Skipping {run_id}: evaluation returned code {sub_res.returncode}")
+            continue
+            
+    with open(res_path, "r") as f:
+        metrics = json.load(f)
+        all_evaluations.append({
+            "dataset": dataset,
+            "run_id": run_id,
+            "weight_type": metrics.get("weight_type", "ema"),
+            "top1": metrics.get("top1"),
+            "top5": metrics.get("top5"),
+            "macro_f1": metrics.get("macro_f1"),
+            "nll": metrics.get("nll"),
+            "ece": metrics.get("ece"),
+            "role": "reported, not used for selection"
+        })
+
+df_all = pd.DataFrame(all_evaluations)
+print("\\n============================== FINAL OFFICIAL TEST RESULTS ==============================")
+print(df_all.to_string(index=False))
+
+with open("/kaggle/working/all_test_evaluations.json", "w") as f:
+    json.dump(all_evaluations, f, indent=4)
+print("\\nWrote /kaggle/working/all_test_evaluations.json")
+"""))
+
+with open("kaggle/04_test.ipynb", "w", encoding="utf-8") as f:
+    nbf.write(nb_test, f)
+
+print("Successfully generated kaggle/03_main.ipynb and kaggle/04_test.ipynb!")

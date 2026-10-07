@@ -56,7 +56,18 @@ def main():
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--mode", choices=["dev", "final"], default="dev")
     parser.add_argument("--force-mix", choices=["none", "mixup", "cutmix", "auto"], default="auto")
+    parser.add_argument("--results-csv", type=str, default=None)
+    parser.add_argument("--export-dir", type=str, default=None)
     args = parser.parse_args()
+
+    total_run_start = time.time()
+    checkpoint_dir = Path("experiments") / args.run_id
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    finished_marker = checkpoint_dir / "FINISHED"
+
+    if args.resume and finished_marker.exists():
+        print(f"--- Run {args.run_id} is already FINISHED. Skipping. ---")
+        return
 
     print(f"--- Training {args.run_id} ---")
     print(f"Dataset: {args.dataset}, Optimizer: {args.optimizer}, LR: {args.lr}, Epochs: {args.epochs}, Mode: {args.mode}")
@@ -215,6 +226,7 @@ def main():
         train_loss /= max(1, step + 1)
         
         # Validation
+        val_t0 = time.time()
         model.eval()
         val_loss = 0.0
         correct_raw = 0
@@ -248,24 +260,98 @@ def main():
             val_top1_ema = 0.0
             
         t1 = time.time()
+        val_time = t1 - val_t0
+        print(f"--- Val Time: {val_time:.4f}s ---")
         
         print(f"Epoch {epoch:03d} | Train: {train_loss:.4f} | Val: {val_loss:.4f} | Top1 Raw: {val_top1_raw:.2f}% | Top1 EMA: {val_top1_ema:.2f}% | LR: {lr:.5f} | Time: {t1-t0:.1f}s")
         
         with open(csv_path, "a") as f:
             f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{val_top1_raw:.4f},{val_top1_ema:.4f},{lr:.6f},{t1-t0:.2f}\n")
             
+        # Check and save best checkpoint
+        best_pt_path = checkpoint_dir / "best.pt"
+        if not hasattr(main, "best_val_top1"):
+            main.best_val_top1 = -1.0
+            main.best_epoch = 0
+        
+        if val_top1_ema > main.best_val_top1 or not best_pt_path.exists():
+            main.best_val_top1 = val_top1_ema
+            main.best_epoch = epoch
+            torch.save({
+                "model": model.state_dict(),
+                "opt": opt.state_dict(),
+                "ema": ema.shadow,
+                "scaler": scaler.state_dict(),
+                "epoch": epoch,
+                "val_top1_raw": val_top1_raw,
+                "val_top1_ema": val_top1_ema
+            }, best_pt_path)
+
         if (epoch + 1) % 2 == 0 or (epoch + 1) == args.epochs or (args.max_steps > 0 and global_step >= args.max_steps):
             torch.save({
                 "model": model.state_dict(),
                 "opt": opt.state_dict(),
                 "ema": ema.shadow,
                 "scaler": scaler.state_dict(),
-                "epoch": epoch
+                "epoch": epoch,
+                "val_top1_raw": val_top1_raw,
+                "val_top1_ema": val_top1_ema
             }, checkpoint_dir / "last.pt")
             
         if args.max_steps > 0 and global_step >= args.max_steps:
             print("Max steps reached overall. Exiting.")
             break
+
+    # If run reached epoch completion or max-steps, handle completion actions
+    is_finished = (epoch + 1 == args.epochs)
+    if is_finished:
+        finished_marker.write_text("FINISHED\n")
+
+    # Read history to summarize
+    best_raw = 0.0
+    best_ema = 0.0
+    final_raw = val_top1_raw
+    final_ema = val_top1_ema
+    best_ep = 0
+    if csv_path.exists():
+        with open(csv_path, "r") as f:
+            lines = [line.strip() for line in f if line.strip()]
+        if len(lines) > 1:
+            for line in lines[1:]:
+                parts = line.split(",")
+                ep_idx = int(parts[0])
+                r_val = float(parts[3])
+                e_val = float(parts[4])
+                if e_val > best_ema:
+                    best_ema = e_val
+                    best_raw = r_val
+                    best_ep = ep_idx
+            final_parts = lines[-1].split(",")
+            final_raw = float(final_parts[3])
+            final_ema = float(final_parts[4])
+
+    wall_time = time.time() - total_run_start
+    peak_vram = (torch.cuda.max_memory_allocated() / (1024 * 1024)) if torch.cuda.is_available() else 0.0
+
+    # Export artifacts if requested
+    if args.export_dir:
+        import shutil
+        exp_path = Path(args.export_dir)
+        exp_path.mkdir(parents=True, exist_ok=True)
+        for item in ["history.csv", "best.pt", "last.pt", "FINISHED"]:
+            src_file = checkpoint_dir / item
+            if src_file.exists():
+                shutil.copy(src_file, exp_path / item)
+
+    # Append to results CSV if requested
+    if args.results_csv and (is_finished or args.max_steps > 0):
+        res_file = Path(args.results_csv)
+        res_file.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not res_file.exists()
+        with open(res_file, "a") as f:
+            if write_header:
+                f.write("dataset,optimizer,lr,epochs,best_val_top1_raw,best_val_top1_ema,final_val_top1_raw,final_val_top1_ema,best_epoch,wall_time,peak_vram_mb\n")
+            f.write(f"{args.dataset},{args.optimizer},{args.lr},{args.epochs},{best_raw:.4f},{best_ema:.4f},{final_raw:.4f},{final_ema:.4f},{best_ep},{wall_time:.2f},{peak_vram:.2f}\n")
 
 if __name__ == "__main__":
     main()

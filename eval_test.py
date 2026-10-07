@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--data-root", default="./data")
     parser.add_argument("--freeze-dir", default="experiments")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--checkpoint-dir", default=None)
+    parser.add_argument("--weight-type", choices=["raw", "ema"], default=None)
     args = parser.parse_args()
     
     if not os.path.exists(os.path.join(args.freeze_dir, "FREEZE.md")):
@@ -30,13 +32,22 @@ def main():
     if os.path.exists(result_path):
         raise RuntimeError("test_results.json already exists! Refusing to overwrite test results.")
         
-    # Read final choice
-    choice_path = os.path.join(out_dir, "final_choice.json")
-    weight_type = "ema"
-    if os.path.exists(choice_path):
-        with open(choice_path, "r") as f:
-            choice = json.load(f)
-            weight_type = choice.get("weight_type", "ema")
+    # Determine weight type: CLI argument -> final_choice.json -> default "ema"
+    weight_type = args.weight_type
+    if weight_type is None:
+        choice_path = os.path.join(out_dir, "final_choice.json")
+        if not os.path.exists(choice_path):
+            choice_path = os.path.join(args.freeze_dir, "final_choice.json")
+        if os.path.exists(choice_path):
+            with open(choice_path, "r") as f:
+                choice = json.load(f)
+                if isinstance(choice, dict):
+                    if args.dataset in choice and "weight_type" in choice[args.dataset]:
+                        weight_type = choice[args.dataset]["weight_type"]
+                    else:
+                        weight_type = choice.get("weight_type", "ema")
+        if weight_type is None:
+            weight_type = "ema"
             
     print(f"Running eval_test.py for {args.run_id} on {args.dataset}. Using {weight_type} weights.")
     
@@ -45,7 +56,11 @@ def main():
     
     model = FlowerLiteL(num_classes=num_classes).to(device)
     
-    ckpt_path = f"experiments/{args.run_id}/last.pt"
+    base_ckpt_dir = args.checkpoint_dir if args.checkpoint_dir else f"experiments/{args.run_id}"
+    ckpt_path = os.path.join(base_ckpt_dir, "best.pt")
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(base_ckpt_dir, "last.pt")
+        
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model"])
     if weight_type == "ema":
