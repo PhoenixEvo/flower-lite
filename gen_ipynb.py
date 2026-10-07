@@ -333,51 +333,125 @@ with open("kaggle/03_main.ipynb", "w", encoding="utf-8") as f:
 nb_test = nbf.v4.new_notebook()
 
 nb_test.cells.append(nbf.v4.new_markdown_cell("""# 04_test.ipynb — Final Test Set Evaluation under FREEZE Gate
-This notebook evaluates the models on the official test set:
-- Enforces `experiments/FREEZE.md` barrier.
-- Evaluates the models selected by validation from `final_choice.json` once per dataset.
-- Evaluates all other finished runs once, labeled: `"reported, not used for selection"`.
-- Refuses to overwrite any existing `test_results.json`.
+This notebook evaluates the models on the official CIFAR test set:
+1. **Auto-detects** attached read-only output from `03_main` under `/kaggle/input/*/final_choice.json`.
+2. **Copies** run folders into `/kaggle/working/runs/` treating the input as read-only.
+3. **DRY_RUN protection**: Default `DRY_RUN = True` lists all runs and stops before touching the test set.
+4. **FREEZE Protection**: Enforces `experiments/FREEZE.md`.
+5. **Write-once**: `eval_test.py` writes `test_results.json` once and refuses to overwrite.
+6. Evaluates winner runs selected by validation, plus other finished runs labeled `"reported, not used for selection"`.
 """))
 
 nb_test.cells.append(nbf.v4.new_code_cell("""import os
 import sys
 import json
+import glob
+import shutil
 import subprocess
 from pathlib import Path
+
+# Setup working repository
+REPO_SOURCE = "git"
+REPO_URL = "https://github.com/PhoenixEvo/flower-lite.git"
 
 if not os.path.exists("eval_test.py"):
     if os.path.exists("flower-lite"):
         os.chdir("flower-lite")
     elif os.path.exists("/kaggle/working/flower-lite"):
         os.chdir("/kaggle/working/flower-lite")
+    else:
+        os.system(f"git clone {REPO_URL} flower-lite")
+        os.chdir("flower-lite")
 
+os.system("pip install -e .")
 print("Working Directory:", os.getcwd())
 assert os.path.exists("eval_test.py"), "eval_test.py must exist!"
 """))
 
-nb_test.cells.append(nbf.v4.new_code_cell("""# Enforce FREEZE gate
-os.makedirs("experiments", exist_ok=True)
-freeze_file = Path("experiments/FREEZE.md")
-with open(freeze_file, "w") as f:
-    f.write("# FREEZE\\nModel selection finalized. Test set unlocked for single-pass evaluation.\\n")
-print("FREEZE.md written. Test evaluation unlocked.")
+nb_test.cells.append(nbf.v4.new_code_cell("""# 1. Auto-detect training output from attached dataset
+search_patterns = [
+    "/kaggle/input/*/final_choice.json",
+    "/kaggle/input/*/*/final_choice.json",
+]
+candidates = []
+for p in search_patterns:
+    candidates.extend(glob.glob(p))
 
-choice_file = Path("/kaggle/working/final_choice.json")
-if not choice_file.exists():
-    choice_file = Path("experiments/final_choice.json")
+if not candidates and os.path.exists("experiments/final_choice.json"):
+    candidates.append("experiments/final_choice.json")
 
-if not choice_file.exists():
-    raise FileNotFoundError("final_choice.json not found! Run 03_main.ipynb first.")
+print(f"Detected candidates for final_choice.json: {candidates}")
+if len(candidates) == 0:
+    raise FileNotFoundError(
+        "Could not find any final_choice.json in /kaggle/input/*/ or /kaggle/input/*/*/. "
+        "Please attach the output of 03_main as an input to this notebook!"
+    )
+elif len(candidates) > 1:
+    raise ValueError(
+        f"Ambiguous training output: found multiple final_choice.json files: {candidates}. "
+        "Please ensure only one 03_main output dataset is attached."
+    )
+
+choice_file = Path(candidates[0])
+print(f"Selected training output config: {choice_file}")
+source_dir = choice_file.parent
 
 with open(choice_file, "r") as f:
     final_choice = json.load(f)
 
-print("Final choice loaded:")
+print("Loaded final choices (selected strictly by validation):")
 print(json.dumps(final_choice, indent=2))
+
+# 2. Treat input folder as read-only. Copy run folders to /kaggle/working/runs/
+working_dir = Path("/kaggle/working")
+working_runs_dir = working_dir / "runs"
+working_runs_dir.mkdir(parents=True, exist_ok=True)
+
+source_runs_dir = source_dir / "runs" if (source_dir / "runs").exists() else source_dir
+
+print(f"\\nCopying run folders from read-only {source_runs_dir} into {working_runs_dir}...")
+copied_runs = []
+for item in source_runs_dir.iterdir():
+    if item.is_dir() and item.name != "runs":
+        dest_run_dir = working_runs_dir / item.name
+        dest_run_dir.mkdir(parents=True, exist_ok=True)
+        for fname in ["best.pt", "last.pt", "history.csv", "FINISHED"]:
+            src_f = item / fname
+            if src_f.exists():
+                shutil.copy2(src_f, dest_run_dir / fname)
+        copied_runs.append(item.name)
+
+print(f"Successfully copied {len(copied_runs)} runs into {working_runs_dir}: {copied_runs}")
 """))
 
-nb_test.cells.append(nbf.v4.new_code_cell("""# Evaluate chosen models on official test set
+nb_test.cells.append(nbf.v4.new_code_cell("""# 3. DRY-RUN Gate & FREEZE Marker
+DRY_RUN = True  # Human: Set to False to perform actual test evaluation
+
+print(f"DRY_RUN status: {DRY_RUN}")
+if DRY_RUN:
+    print("\\n============================== DRY RUN MODE ==============================")
+    print("The following chosen models (selected strictly by validation) WOULD be evaluated:")
+    for dataset, info in final_choice.items():
+        print(f"  * [{dataset.upper()}] Run: '{info['run_id']}' (Weights: '{info.get('weight_type', 'ema').upper()}')")
+    print("\\nThe following other finished runs WOULD be evaluated as 'reported, not used for selection':")
+    for r_name in copied_runs:
+        if not any(info.get("run_id") == r_name for info in final_choice.values()):
+            d_name = "cifar10" if "c10" in r_name else "cifar100"
+            print(f"  * [{d_name.upper()}] Run: '{r_name}'")
+    print("\\n[STOPPING] DRY_RUN is True. Test set has NOT been touched.")
+    print("Please set DRY_RUN = False in this cell and re-run to perform final official evaluation.")
+    print("==========================================================================")
+    raise RuntimeError("DRY_RUN is True. Halted before touching test set. Set DRY_RUN = False to proceed.")
+
+# Write FREEZE marker to unlock evaluation
+os.makedirs("experiments", exist_ok=True)
+freeze_file = Path("experiments/FREEZE.md")
+with open(freeze_file, "w") as f:
+    f.write("# FREEZE\\nModel selection finalized. Test set unlocked for single-pass evaluation.\\n")
+print(f"Wrote {freeze_file}. Test set evaluation gate is now unlocked.")
+"""))
+
+nb_test.cells.append(nbf.v4.new_code_cell("""# 4. Evaluate chosen winner models on official test set
 test_outputs = {}
 
 for dataset, info in final_choice.items():
@@ -411,16 +485,13 @@ for dataset, info in final_choice.items():
         test_outputs[dataset] = json.load(f)
 """))
 
-nb_test.cells.append(nbf.v4.new_code_cell("""from pathlib import Path
-import json
+nb_test.cells.append(nbf.v4.new_code_cell("""# 5. Evaluate other finished runs ('reported, not used for selection') & print summary table
 import pandas as pd
 
-runs_base = Path("/kaggle/working/runs")
-if not runs_base.exists():
-    runs_base = Path("experiments")
-
+working_runs = Path("/kaggle/working/runs")
 all_evaluations = []
 
+# First, record the chosen winners
 for dataset, res in test_outputs.items():
     all_evaluations.append({
         "dataset": dataset,
@@ -434,14 +505,15 @@ for dataset, res in test_outputs.items():
         "role": "SELECTED WINNER (chosen by validation)"
     })
 
-for run_dir in sorted(runs_base.iterdir()):
+# Next, record other finished runs
+for run_dir in sorted(working_runs.iterdir()):
     if not run_dir.is_dir():
         continue
     run_id = run_dir.name
     if any(e["run_id"] == run_id for e in all_evaluations):
         continue
         
-    dataset = "cifar10" if "c10_" in run_id or "cifar10" in run_id else "cifar100"
+    dataset = "cifar10" if "c10" in run_id or "cifar10" in run_id else "cifar100"
     res_path = run_dir / "test_results.json"
     
     if not res_path.exists():
@@ -484,5 +556,7 @@ print("\\nWrote /kaggle/working/all_test_evaluations.json")
 
 with open("kaggle/04_test.ipynb", "w", encoding="utf-8") as f:
     nbf.write(nb_test, f)
+
+print("Successfully regenerated kaggle/04_test.ipynb!")
 
 print("Successfully generated kaggle/03_main.ipynb and kaggle/04_test.ipynb!")
