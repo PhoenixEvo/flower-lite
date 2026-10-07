@@ -1,3 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowerlite"
+version = "0.1.0"
+description = "FlowerLite-L Architecture for CIFAR"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "torchvision",
+    "pyyaml",
+    "numpy",
+    "pandas",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
 [tool.ruff]
 line-length = 999
 ignore = ['E', 'F', 'W', 'C', 'N', 'B', 'A', 'PT', 'SIM', 'RUF', 'PL', 'DTZ', 'TRY', 'BLE']
