@@ -44,10 +44,49 @@ import flowerlite
 print("FlowerLite package successfully imported!")
 
 DATA_ROOT = "/kaggle/working/data"
+os.makedirs(DATA_ROOT, exist_ok=True)
+
+import glob
+import shutil
 import torchvision
-torchvision.datasets.CIFAR10(root=DATA_ROOT, download=True)
-torchvision.datasets.CIFAR100(root=DATA_ROOT, download=True)
-print("CIFAR-10 and CIFAR-100 verified.")
+
+# Auto-detect offline dataset under /kaggle/input if attached
+c10_batch1 = glob.glob("/kaggle/input/**/data_batch_1", recursive=True)
+if c10_batch1:
+    src_c10_dir = os.path.dirname(c10_batch1[0])
+    target_c10_dir = os.path.join(DATA_ROOT, "cifar-10-batches-py")
+    if not os.path.exists(target_c10_dir):
+        print(f"Detected attached CIFAR-10 at {src_c10_dir}. Linking to {target_c10_dir}...")
+        try:
+            os.symlink(src_c10_dir, target_c10_dir)
+        except Exception:
+            shutil.copytree(src_c10_dir, target_c10_dir)
+else:
+    print("Downloading CIFAR-10...")
+    torchvision.datasets.CIFAR10(root=DATA_ROOT, download=True)
+
+c100_train = glob.glob("/kaggle/input/**/train", recursive=True)
+c100_found = False
+for t_path in c100_train:
+    dir_path = os.path.dirname(t_path)
+    if os.path.exists(os.path.join(dir_path, "meta")) and os.path.exists(os.path.join(dir_path, "test")):
+        target_c100_dir = os.path.join(DATA_ROOT, "cifar-100-python")
+        if not os.path.exists(target_c100_dir):
+            print(f"Detected attached CIFAR-100 at {dir_path}. Linking to {target_c100_dir}...")
+            try:
+                os.symlink(dir_path, target_c100_dir)
+            except Exception:
+                shutil.copytree(dir_path, target_c100_dir)
+        c100_found = True
+        break
+
+if not c100_found:
+    print("Downloading CIFAR-100...")
+    torchvision.datasets.CIFAR100(root=DATA_ROOT, download=True)
+
+c10_ds = torchvision.datasets.CIFAR10(root=DATA_ROOT, download=False)
+c100_ds = torchvision.datasets.CIFAR100(root=DATA_ROOT, download=False)
+print(f"Dataset verification PASSED: CIFAR-10 ({len(c10_ds)} images), CIFAR-100 ({len(c100_ds)} images).")
 """))
 
 nb_main.cells.append(nbf.v4.new_code_cell("""# ==========================================
