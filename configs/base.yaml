@@ -1,0 +1,54 @@
+model:
+  name: "flowerlite_l"
+  stem_width: 64
+  stage_widths: [64, 128, 256, 384]
+  stage_depths: [3, 4, 6, 3]
+  expansion: 2.0
+  se_ratio: 0.125
+  activation: "silu"
+  drop_path_rate: 0.10
+  attention_after_stage: 3
+  attention_heads: 4
+  attention_head_dim: 64
+  attention_mlp_dim: 384
+  head_hidden_dim: 768
+  head_dropout: 0.15
+
+distributed:
+  enabled: false
+  backend: "nccl"
+  sync_bn: false
+
+data:
+  root: "./data"
+  global_batch_size: 256
+  num_workers_per_gpu: 4
+  trivial_augment: true
+  mixup_prob: 0.5
+  cutmix_prob: 0.5
+  mix_alpha: 1.0
+  label_smoothing: 0.1
+
+optim:
+  optimizer: "sgd"
+  lr: 0.10
+  momentum_beta1: 0.9
+  beta2: 0.999
+  eps: 1.0e-08
+  weight_decay: 0.0001
+
+schedule:
+  epochs: 120
+  warmup_epochs: 5
+  eta_min: 0.0
+
+runtime:
+  seed: 2026
+  clip_grad_norm: 5.0
+  amp: true
+  ema: true
+  ema_decay: 0.9998
+  print_freq: 20
+
+tracking:
+  experiment_root: "experiments"

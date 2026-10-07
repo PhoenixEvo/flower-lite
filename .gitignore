@@ -1,0 +1,32 @@
+# Data
+data/
+*.tar.gz
+*.tar
+
+# AI and Prompts
+.agents/
+.AGENTS/
+Agent_System_Prompt.md
+MASTER_PROMPT.md
+
+# Checkpoints and Experiment Artifacts
+experiments/
+*.pt
+*.pth
+*.ckpt
+
+# Python / Caches / Build
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Temp
+hardware.json
+rep.py
+tmp*/

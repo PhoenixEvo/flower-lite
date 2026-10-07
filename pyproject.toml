@@ -1,0 +1,3 @@
+[tool.ruff]
+line-length = 999
+ignore = ['E', 'F', 'W', 'C', 'N', 'B', 'A', 'PT', 'SIM', 'RUF', 'PL', 'DTZ', 'TRY', 'BLE']
