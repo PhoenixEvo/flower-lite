@@ -25,6 +25,7 @@ print(f"PyTorch Version: {torch.__version__}, Available GPUs: {torch.cuda.device
 """))
 
 nb_main.cells.append(nbf.v4.new_code_cell("""import os
+import sys
 import shutil
 
 REPO_SOURCE = "git"  # Options: "git" or "kaggle"
@@ -39,9 +40,12 @@ else:
         os.system("cp -r /kaggle/input/flowerlite-repo /kaggle/working/flower-lite")
     os.chdir("/kaggle/working/flower-lite")
 
+if os.path.abspath("src") not in sys.path:
+    sys.path.insert(0, os.path.abspath("src"))
+
 os.system("pip install -e .")
 import flowerlite
-print("FlowerLite package successfully imported!")
+print("FlowerLite package successfully imported from:", flowerlite.__file__)
 
 DATA_ROOT = "/kaggle/working/data"
 os.makedirs(DATA_ROOT, exist_ok=True)
@@ -511,8 +515,13 @@ if not os.path.exists("eval_test.py"):
         os.system(f"git clone {REPO_URL} flower-lite")
         os.chdir("flower-lite")
 
+if os.path.abspath("src") not in sys.path:
+    sys.path.insert(0, os.path.abspath("src"))
+
 os.system("pip install -e .")
+import flowerlite
 print("Working Directory:", os.getcwd())
+print("FlowerLite package successfully imported from:", flowerlite.__file__)
 assert os.path.exists("eval_test.py"), "eval_test.py must exist!"
 """))
 
