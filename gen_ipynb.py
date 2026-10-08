@@ -31,17 +31,24 @@ import shutil
 REPO_SOURCE = "git"  # Options: "git" or "kaggle"
 REPO_URL = "https://github.com/PhoenixEvo/flower-lite.git"
 
+if os.path.exists("/kaggle/working"):
+    os.chdir("/kaggle/working")
+
 if REPO_SOURCE == "git":
     if not os.path.exists("flower-lite"):
         os.system(f"git clone {REPO_URL} flower-lite")
-    os.chdir("flower-lite")
+        os.chdir("flower-lite")
+    else:
+        os.chdir("flower-lite")
+        os.system("git pull")
 else:
     if os.path.exists("/kaggle/input/flowerlite-repo"):
         os.system("cp -r /kaggle/input/flowerlite-repo /kaggle/working/flower-lite")
     os.chdir("/kaggle/working/flower-lite")
 
-if os.path.abspath("src") not in sys.path:
-    sys.path.insert(0, os.path.abspath("src"))
+for p in [os.path.abspath("src"), "/kaggle/working/flower-lite/src"]:
+    if os.path.exists(p) and p not in sys.path:
+        sys.path.insert(0, p)
 
 os.system("pip install -e .")
 import flowerlite
@@ -506,17 +513,23 @@ from pathlib import Path
 REPO_SOURCE = "git"
 REPO_URL = "https://github.com/PhoenixEvo/flower-lite.git"
 
+if os.path.exists("/kaggle/working"):
+    os.chdir("/kaggle/working")
+
 if not os.path.exists("eval_test.py"):
     if os.path.exists("flower-lite"):
         os.chdir("flower-lite")
+        os.system("git pull")
     elif os.path.exists("/kaggle/working/flower-lite"):
         os.chdir("/kaggle/working/flower-lite")
+        os.system("git pull")
     else:
         os.system(f"git clone {REPO_URL} flower-lite")
         os.chdir("flower-lite")
 
-if os.path.abspath("src") not in sys.path:
-    sys.path.insert(0, os.path.abspath("src"))
+for p in [os.path.abspath("src"), "/kaggle/working/flower-lite/src"]:
+    if os.path.exists(p) and p not in sys.path:
+        sys.path.insert(0, p)
 
 os.system("pip install -e .")
 import flowerlite
