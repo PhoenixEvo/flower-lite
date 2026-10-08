@@ -290,72 +290,13 @@ print(f"GPU 1 (CIFAR-100) Configs: {configs_gpu1}")
 
 nb_main.cells.append(nbf.v4.new_code_cell("""import subprocess
 import time
-
-results_csv = working_dir / results_csv_name
-
-# Write worker runner script
-runner_script = Path("/kaggle/working/worker_runner.py")
-runner_code = f'''
-import sys
 import os
+import sys
 import json
-import subprocess
 from pathlib import Path
 
-gpu_id = sys.argv[1]
-configs_json = sys.argv[2]
-data_root = sys.argv[3]
-results_csv_path = sys.argv[4]
-
-configs = json.loads(configs_json)
-log_file = Path(f"/kaggle/working/log_gpu{{gpu_id}}.txt")
-
-with open(log_file, "a") as f:
-    f.write(f"=== Starting GPU {{gpu_id}} Worker ===\\n")
-
-for cfg in configs:
-    run_id = cfg["run_id"]
-    dataset = cfg["dataset"]
-    opt = cfg["optimizer"]
-    lr = cfg["lr"]
-    epochs = cfg["epochs"]
-    
-    marker_local = Path("experiments") / run_id / "FINISHED"
-    marker_work = Path("/kaggle/working/runs") / run_id / "FINISHED"
-    if marker_local.exists() or marker_work.exists():
-        with open(log_file, "a") as f:
-            f.write(f"[GPU {{gpu_id}}] Run {{run_id}} is already FINISHED. Skipping.\\n")
-        continue
-
-    cmd = [
-        sys.executable, "train.py",
-        "--config", "configs/base.yaml",
-        "--dataset", dataset,
-        "--optimizer", opt,
-        "--lr", str(lr),
-        "--epochs", str(epochs),
-        "--run-id", run_id,
-        "--data-root", data_root,
-        "--mode", "dev",
-        "--resume",
-        "--results-csv", results_csv_path,
-        "--export-dir", f"/kaggle/working/runs/{{run_id}}"
-    ]
-
-    with open(log_file, "a") as f:
-        f.write(f"[GPU {{gpu_id}}] Launching: {{' '.join(cmd)}}\\n")
-        f.flush()
-        ret = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
-        if ret.returncode != 0:
-            f.write(f"[GPU {{gpu_id}}] Run {{run_id}} FAILED with code {{ret.returncode}}\\n")
-            sys.exit(ret.returncode)
-        else:
-            f.write(f"[GPU {{gpu_id}}] Run {{run_id}} COMPLETED successfully.\\n")
-
-with open(log_file, "a") as f:
-    f.write(f"=== GPU {{gpu_id}} All Configs Done ===\\n")
-'''
-runner_script.write_text(runner_code)
+results_csv = working_dir / results_csv_name
+worker_script = "tools/run_worker.py"
 
 log_gpu0 = "/kaggle/working/log_gpu0.txt"
 log_gpu1 = "/kaggle/working/log_gpu1.txt"
@@ -366,8 +307,8 @@ if os.path.exists(log_gpu1): os.remove(log_gpu1)
 env0 = {**os.environ, "CUDA_VISIBLE_DEVICES": "0"}
 env1 = {**os.environ, "CUDA_VISIBLE_DEVICES": "1"}
 
-p0 = subprocess.Popen([sys.executable, str(runner_script), "0", json.dumps(configs_gpu0), DATA_ROOT, str(results_csv)], env=env0)
-p1 = subprocess.Popen([sys.executable, str(runner_script), "1", json.dumps(configs_gpu1), DATA_ROOT, str(results_csv)], env=env1)
+p0 = subprocess.Popen([sys.executable, worker_script, "0", json.dumps(configs_gpu0), DATA_ROOT, str(results_csv)], env=env0)
+p1 = subprocess.Popen([sys.executable, worker_script, "1", json.dumps(configs_gpu1), DATA_ROOT, str(results_csv)], env=env1)
 
 def print_tail(file_path, num_lines=15):
     if not os.path.exists(file_path):
