@@ -171,29 +171,31 @@ sec_per_epoch = measure_sec_per_epoch("0", data_root=DATA_ROOT)
 # Number of configs running sequentially per GPU: 4 for sweep, 1 for final
 num_runs_per_gpu = 4 if STAGE == "sweep" else 1
 seconds_per_config_epoch = num_runs_per_gpu * sec_per_epoch
-max_safe_N = math.floor((BUDGET_HOURS * 3600.0) / seconds_per_config_epoch)
+budget_hours_val = float(BUDGET_HOURS)
+max_safe_N = math.floor((budget_hours_val * 3600.0) / seconds_per_config_epoch)
 
 print(f"\\n================ TIME GUARD SUMMARY ({STAGE.upper()}) ================")
 print(f"Measured sec/epoch: {sec_per_epoch:.2f}s")
 print(f"Configs per GPU: {num_runs_per_gpu}")
-print(f"Budget: {BUDGET_HOURS} hours")
+print(f"Budget: {budget_hours_val:.2f} hours")
 print(f"Largest safe N (epochs) that fits budget: {max_safe_N}")
 print(f"===============================================================\\n")
 
 if EPOCHS is None:
     raise ValueError(
         f"EPOCHS is currently None! Based on measured {sec_per_epoch:.2f} s/epoch and {num_runs_per_gpu} runs per GPU, "
-        f"the largest safe epoch count fitting BUDGET_HOURS ({BUDGET_HOURS}h) is {max_safe_N}. "
-        f"Please set EPOCHS = {max_safe_N} (or any integer <= {max_safe_N}) in Cell 3 and re-run."
+        f"the largest safe epoch count fitting BUDGET_HOURS ({budget_hours_val:.2f}h) is {max_safe_N}. "
+        f"Please set EPOCHS = {max_safe_N} (or any integer <= {max_safe_N}, e.g. 30 or 40 for a fast sweep) in Cell 3 and re-run."
     )
 
-projected_hours = (seconds_per_config_epoch * EPOCHS) / 3600.0
-print(f"Configured EPOCHS: {EPOCHS}")
-print(f"Projected wall-clock time: {projected_hours:.2f} hours (Budget: {BUDGET_HOURS} hours)")
+epochs_val = int(EPOCHS)
+projected_hours = (seconds_per_config_epoch * epochs_val) / 3600.0
+print(f"Configured EPOCHS: {epochs_val}")
+print(f"Projected wall-clock time: {projected_hours:.2f} hours (Budget: {budget_hours_val:.2f} hours)")
 
-if projected_hours > BUDGET_HOURS:
+if projected_hours > budget_hours_val:
     raise RuntimeError(
-        f"Projected runtime ({projected_hours:.2f}h) EXCEEDS budget ({BUDGET_HOURS}h)! "
+        f"Projected runtime ({projected_hours:.2f}h) EXCEEDS budget ({budget_hours_val:.2f}h)! "
         f"The maximum safe epoch count is {max_safe_N}. Please reduce EPOCHS <= {max_safe_N}."
     )
 print("Time guard passed successfully! Proceeding to execution.")
